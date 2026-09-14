@@ -2,10 +2,13 @@
 
 场景 A：近地基毛细返潮，证据闭合 —— 剔除污染样本、留理由、封版、产物校验。
 场景 B：返潮与渗漏证据并列 + 电荷账/时序门控演示 —— 不输出唯一盐源，给补样建议。
+场景 C：敷贴脱盐试验 —— 盐是真离墙还是退到地杖深处。
+场景 D：脱盐后微气候结晶循环 —— 平均 RH 平稳，墙角传感器昼夜反复跨阈。
 """
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
 
 from .analysis import review
 from .app import SaltApiApp
@@ -360,7 +363,156 @@ def main():
         raise SystemExit("确认版后竟然还能写入！")
     except PermissionError as e:
         line(f"确认版只读校验：409 — {e}")
+
+    # ---------- 场景 D：脱盐后微气候结晶循环 ----------
+    line("\n" + "=" * 78)
+    line("场景 D：脱盐后微气候 —— 平均 RH 平稳，墙角传感器却在昼夜反复跨阈")
+    run_microclimate_demo(app, wid, locked["version_id"])
     line("演示结束。")
+
+
+# ---------------------------------------------------------------- 场景 D 数据
+
+# 盐类规则：潮解 RH（DRH）/析晶 RH（CRH，更低）/温区/最短持续时间
+D_RULES = [
+    {"rule_id": "nacl", "salt": "NaCl", "cn": "氯化钠",
+     "drh_percent": 75.3, "crh_percent": 70.0,
+     "temp_min_c": 10.0, "temp_max_c": 30.0,
+     "min_wet_hours": 6.0, "min_dry_hours": 6.0},
+]
+D_CAL = {"calibrated_ts": "2026-07-15T00:00:00",
+         "valid_until_ts": "2027-07-15T00:00:00",
+         "rh_offset_pct": 0.4, "temp_offset_c": -0.1,
+         "instrument": "ROTRONIC HC2A", "lab": "省文保中心计量室"}
+
+
+def _d_readings(sid, days, t0, rhpat=(61, 66, 78, 77, 71, 64, 60, 60),
+                temp=22.0):
+    out = []
+    for d in range(days):
+        for i, rh in enumerate(rhpat):
+            out.append({"reading_id": f"{sid}_{d}_{i}", "sensor_id": sid,
+                        "ts": (t0 + timedelta(hours=d * 24 + i * 3)).isoformat(),
+                        "temp": temp, "rh": rh})
+    return out
+
+
+def run_microclimate_demo(app, wid, src_vid):
+    """场景 D：引用场景 A 已封版来源（唯一盐源）；一好一坏两个分区。"""
+    body = {
+        "name": "西配殿北壁脱盐后微气候监测",
+        "source_version_id": src_vid,
+        "zones": [
+            {"zone_id": "z_corner", "name": "西北角（脱盐区）",
+             "x_mm": 0, "y_mm": 0, "width_mm": 900, "height_mm": 1200},
+            {"zone_id": "z_center", "name": "墙面中部（对照）",
+             "x_mm": 1200, "y_mm": 1400, "width_mm": 900, "height_mm": 1200},
+        ],
+        "sensors": [
+            {"sensor_id": "T_corner", "x_mm": 450, "y_mm": 600,
+             "calibrations": [D_CAL]},
+            {"sensor_id": "T_center", "x_mm": 1650, "y_mm": 2000,
+             "calibrations": [dict(D_CAL, calibrated_ts="2026-07-20T00:00:00")]},
+        ],
+        "rules": D_RULES,
+    }
+    mon = app.create_monitor(wid, body)["monitor"]
+    mid = mon["monitor_id"]
+    t0 = datetime(2026, 9, 1)
+    # 墙角：夜间 RH 78% 越过 DRH 75.3，白天回到 CRH 70 以下——昼夜循环
+    rd_corner = _d_readings("T_corner", 4, t0)
+    # 中区：RH 始终 55~62%，在两条阈值之下
+    rd_center = _d_readings("T_center", 4, t0, rhpat=(56, 58, 62, 61, 59, 57, 55, 55))
+    app.add_readings(mid, rd_corner + rd_center)
+    line(f"监测计划 {mid}：2 分区 / 2 传感器 / {len(rd_corner)+len(rd_center)} 条读数，"
+         "引用来源封版 " + src_vid)
+
+    a0 = app.get_monitor_analysis(mid)["analysis"]
+    for z in a0["zones"]:
+        show_zone(z)
+    zc = next(z for z in a0["zones"] if z["zone_id"] == "z_corner")
+    assert zc["status"] == "assessed" and zc["n_complete_cycles"] >= 3
+    zctr = next(z for z in a0["zones"] if z["zone_id"] == "z_center")
+    assert zctr["n_complete_cycles"] == 0 and zctr["risk_level"] == "low"
+
+    # 采用序列演示：多序列/多解时显式 adopt_sensor，留痕指定代表序列
+    line("\n— 采用序列：为中区显式指定 T_center 固定站为代表序列（独立修订账留痕）—")
+    rev = app.add_monitor_revision(mid, {
+        "kind": "adopt_sensor", "actor": "王工",
+        "reason": "中区有便携巡测与固定站两条序列，按监测方案固定采用"
+                  " T_center 固定站数据代表中区",
+        "payload": {"zone_id": "z_center", "sensor_id": "T_center"}})
+    line(f"修订 {rev['revision']['rev_id']}：中区采用序列确定，"
+         f"待判分区数 {rev['n_pending']}")
+
+    # 保守规则演示：凌晨低温超出 NaCl 规则温区 10℃ 下限 → 待判 → 留理由派生保守规则
+    cold = _d_readings("T_corner", 1, t0 + timedelta(days=10), temp=4.0)
+    # 新监测计划单独演示温区不足与保守派生
+    mon2 = app.create_monitor(wid, dict(
+        body, name="冬季低温微气候监测",
+        zones=[body["zones"][0]],
+        sensors=[{"sensor_id": "T_corner", "x_mm": 450, "y_mm": 600,
+                  "calibrations": [D_CAL]}]))["monitor"]
+    app.add_readings(mon2["monitor_id"], cold)
+    before = app.get_monitor_analysis(mon2["monitor_id"])["analysis"]
+    zg = before["zones"][0]
+    line(f"低温场景首次分析：status={zg['status']}，"
+         "缺口=" + "、".join(g["code"] for g in zg["gaps"]))
+    assert zg["status"] == "pending"
+    rc = app.add_monitor_revision(mon2["monitor_id"], {
+        "kind": "adopt_conservative_rule", "actor": "张工/王工",
+        "reason": "库房凌晨实测 4℃ 低于 NaCl 规则温区下限 10℃；补做低温潮解"
+                  "实验前先按安全侧派生保守规则：温区放宽到 0℃，DRH/CRH 各下调"
+                  " 5 个百分点（更易识别湿润、更难判定析晶）",
+        "payload": {"zone_id": "z_corner", "rule_id": "nacl",
+                    "temp_min_c": 0.0}})
+    line(f"修订 {rc['revision']['rev_id']}：保守规则 nacl_conservative 生效，"
+         f"待判分区数 {rc['n_pending']}")
+    assert rc["n_pending"] == 0
+
+    # 确认版：冻结来源、规则与采用序列
+    conf = app.confirm_monitor(mid, {"actor": "张工"})
+    line("\n确认版（冻结来源、规则与采用序列）："
+         + json.dumps({k: conf[k] for k in
+                       ("version_id", "source_version_id", "confirm_hash",
+                        "n_pending", "n_assessed")}, ensure_ascii=False))
+    ctype, raw, _ = app.get_monitor_version(conf["version_id"], "/zones.json")
+    payload = json.loads(raw)
+    from .microclimate_recompute import verify as verify_micro
+    ok = verify_micro(payload)
+    _, svg, _ = app.get_monitor_version(conf["version_id"], "/risk.svg")
+    line(f"逐区 JSON：{len(raw)} 字节，复算一致={ok}，"
+         f"input_hash={payload['input_hash']}")
+    line(f"风险曲线 SVG：{len(svg)} 字节，以 <svg> 开头："
+         f"{svg.lstrip().startswith('<svg')}")
+    try:
+        app.add_readings(mid, rd_corner[:1])
+        raise SystemExit("确认版后竟然还能写入！")
+    except PermissionError as e:
+        line(f"确认版只读校验：409 — {e}")
+
+
+def show_zone(z):
+    mark = {"high": "高风险", "moderate": "中风险", "low": "低风险",
+            "current_wet": "当前湿润", "unknown": "待判"}.get(z["risk_level"])
+    line(f"\n  [{z['name']}] status={z['status']} 风险={mark}")
+    if z["status"] == "pending":
+        for g in z["gates"]:
+            if not g["passed"]:
+                line(f"    ✗ {g['name']}：{g['detail']}")
+        return
+    line(f"    完整循环 {z['n_complete_cycles']} 次 ｜ 最长湿润段 "
+         f"{z['longest_wet_hours'] if z['longest_wet_hours'] is not None else '—'}h ｜ "
+         f"首个风险时刻 {z['first_risk_ts'] or '—'}"
+         + (" ｜ ⚠ 开口湿润 " + str(z["open_wet"]["hours"]) + "h"
+            if z.get("open_wet") else ""))
+    for rr in z["rules"]:
+        if rr.get("assessable"):
+            line(f"    规则 {rr['rule_id']}（DRH {rr['drh_percent']}% / "
+                 f"CRH {rr['crh_percent']}%）：完整 {rr['n_complete_cycles']}，"
+                 f"短时回返 {rr['n_short_returns']}，跨阈 "
+                 f"{len(rr['crossings'])} 次"
+                 + ("（保守派生）" if rr.get("conservative") else ""))
 
 
 if __name__ == "__main__":

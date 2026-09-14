@@ -10,18 +10,28 @@
 库存变化与邻近对照区漂移放在同一本账上核算，区分**净移除 / 向内迁移 / 证据不足**；
 试验修订在 SQLite 中独立建账，确认版固定引用的来源复核封版、轮次与决定。
 
+1.2 起接入**微气候结晶循环**：脱盐刚完成时库房平均湿度看似平稳，墙角传感器却可能在
+昼夜波动中反复越过某类盐的潮解临界（DRH）与析晶临界（CRH）。本模块按墙面分区登记
+温湿度传感器、校准记录与采样时序，按盐类规则（潮解/析晶 RH、温度适用范围、最短持续
+时间、滞回带）扫描“跨阈—停留—回返”，统计每区**完整循环数、最长湿润段与首个风险
+时刻**；校准失效、时序断档、单位冲突、规则温区不足、映射多解或来源版仍无结论时，
+对应分区保持**待判**并列出缺口。
+
 > 设计红线：层位错绑、坐标越界、电荷账不闭合、检测限缺失、时序断档（雨后间隔与干湿阶段未对齐）
 > 或候选并列时，**绝不输出唯一盐源**。
 >
 > 敷贴试验红线：样本无法配对、轮次重叠、固液基准混用、浸出液缺检测限、收支不闭合
 > 或深层浓度升高时，**绝不建议结束处理**。
+>
+> 微气候红线：来源版无结论、传感器映射多解/缺失、校准失效、时序断档、单位冲突或
+> 规则温区覆盖不足时，对应分区**绝不输出循环结论，只列待判缺口**。
 
 ## 运行
 
 ```bash
 python3 -m fresco_salt.app --host 127.0.0.1 --port 8000 --db fresco.db
 python3 -m fresco_salt.demo           # 端到端演示（内存库，不落盘）
-python3 -m unittest discover -s tests # 43 个单元 + HTTP 测试
+python3 -m unittest discover -s tests # 74 个单元 + HTTP 测试
 ```
 
 ## 单位统一
@@ -67,6 +77,15 @@ CBE = (Σ 阳离子当量 − Σ 阴离子当量) / ((Σ+ + Σ−) / 2) × 100%
 | POST | `/trials/{id}/confirm` | **确认版**：固定来源、轮次与决定，试验转只读 |
 | GET | `/trials/{id}/versions` | 确认版列表 |
 | GET | `/trial-versions/{vid}` / `…/rounds.json` / `…/balance.svg` | 确认版元数据 / 逐轮 JSON / 离子收支 SVG |
+| POST | `/walls/{id}/monitors` | 建立微气候监测计划（分区/传感器/校准/盐类规则，须引用已封版来源） |
+| GET | `/walls/{id}/monitors` | 监测计划列表 |
+| GET | `/monitors/{id}` | 监测计划定义与读数/修订计数 |
+| POST | `/monitors/{id}/readings` | 登记温湿度读数（数组，支持 ℃/℉/K、%/小数） |
+| GET/POST | `/monitors/{id}/analysis` | 逐区循环分析（跨阈、停留、回返、完整循环、最长湿润段、首风险时刻） |
+| GET/POST | `/monitors/{id}/revisions` | 查询微气候修订账（独立保存）/ 改绑、采用序列、保守规则修订 |
+| POST | `/monitors/{id}/confirm` | **确认版**：冻结来源、规则与采用序列，监测转只读 |
+| GET | `/monitors/{id}/versions` | 确认版列表 |
+| GET | `/microclimate-versions/{vid}` / `…/zones.json` / `…/risk.svg` | 确认版元数据 / 逐区 JSON / 风险曲线 SVG |
 
 ### 样本结构
 
@@ -193,6 +212,104 @@ CBE = (Σ 阳离子当量 − Σ 阴离子当量) / ((Σ+ + Σ−) / 2) × 100%
 
 确认版后试验任何写操作返回 `409`；需要变更时应新建试验。
 
+## 微气候盐结晶循环
+
+脱盐完成后，修复师按墙面分区建立监测计划（`POST /walls/{id}/monitors`），引用**已封版
+来源**：`source_kind=review`（默认，来源复核封版，须 `unique_source`）或 `trial`
+（敷贴试验确认版，须分类 `net_removal`）；来源仍无结论时全部循环统计保持待判。
+
+```json
+{
+  "name": "脱盐后微气候监测",
+  "source_version_id": "v_5aba3048",
+  "zones": [
+    {"zone_id": "z_corner", "name": "西北角", "x_mm": 0, "y_mm": 0,
+     "width_mm": 900, "height_mm": 1200}
+  ],
+  "sensors": [
+    {"sensor_id": "T_corner", "x_mm": 450, "y_mm": 600,
+     "calibrations": [
+       {"calibrated_ts": "2026-07-15T00:00:00",
+        "valid_until_ts": "2027-07-15T00:00:00",
+        "rh_offset_pct": 0.4, "temp_offset_c": -0.1}]}
+  ],
+  "rules": [
+    {"rule_id": "nacl", "salt": "NaCl", "cn": "氯化钠",
+     "drh_percent": 75.3, "crh_percent": 70.0,
+     "temp_min_c": 10.0, "temp_max_c": 30.0,
+     "min_wet_hours": 6.0, "min_dry_hours": 6.0}
+  ],
+  "zone_salts": [{"zone_id": "z_corner", "rule_id": "nacl"}]
+}
+```
+
+* **分区**：矩形（x/y/宽高）或圆形（x/y/radius_mm），不得越出墙面；不提供 `zone_salts`
+  时全部规则逐区评估。
+* **传感器映射**：默认按坐标几何落区；落在分区重叠区构成**映射多解**，一区多条序列
+  构成**多序列**，均待判。建账时可用 `zone_id` 显式声明；改绑到几何范围之外须在理由中
+  说明现场布设依据。
+* **校准**：每只传感器至少一条校准记录；读数时刻取 `calibrated_ts ≤ ts` 的最新一条，
+  超过 `valid_until_ts`（或无任何校准）即**校准失效**；`rh_offset_pct`/`temp_offset_c`
+  在扫描前施加。
+* **读数**：`POST /monitors/{id}/readings`，每条 `{sensor_id, ts, temp, rh}`；
+  温度支持 `C/F/K`（`temp_unit`，默认 `C`），湿度支持 `%`/`fraction`（`rh_unit`，
+  默认 `%`）。同序列单位混录判**单位冲突**；`temp`/`rh` 可为 `null`（缺测）。
+  相邻读数间隔超过 `gap_max_hours`（默认 6h）判**时序断档**，断档两侧湿润段不拼接；
+  重复时间戳同样拦截。
+* **盐类规则**：`crh_percent < drh_percent` 是硬约束（滞回带）。
+
+### 循环状态机（含滞回）
+
+对每条有效序列 × 每条适用规则：
+
+1. RH 向上插值越过 **DRH** → 进入湿润；只有向下越过更低的 **CRH** 才回到干燥；
+   RH 在 `[CRH, DRH]` 滞回带内波动**保持原态**，不伪造析晶；
+2. 湿润停留 `< min_wet_hours` 即回落，只登记为**短时回返**（`short_returns`），
+   不计循环；干燥停留 `< min_dry_hours` 又再湿润，循环不完整；
+3. 断档/缺测/校准失效/温度越出规则温区处切段；断档时仍湿润记为**开口湿润段**
+   （`open_wet`），不跨段拼接；
+4. 逐区汇总每条规则的**完整循环数、最长湿润段（小时）、首个风险时刻**（第一次合格
+   湿润跨阈时刻）与跨阈事件；多规则按盐类分别给数，区级取最早首风险。
+
+风险分级：开口湿润 → `current_wet`；完整循环 ≥3（`risk_cycles_high`）→ `high`；
+≥1 → `moderate`；否则 `low`。
+
+### 待判门控（六类缺口）
+
+| code | 名称 | 触发 |
+| --- | --- | --- |
+| `source` | 来源版结论 | 引用的复核封版非 `unique_source`，或敷贴确认版非 `net_removal` |
+| `mapping` | 传感器—样本区映射 | 无传感器、几何跨区多解、一区多序列且未指定采用序列 |
+| `calibration` | 校准有效性 | 读数落在校准有效期之外（含无校准记录） |
+| `time` | 采样时序 | 断档、缺测、重复时间戳、有效点不足 |
+| `units` | 单位一致 | 同序列 ℃/℉/K 或 %/fraction 混录 |
+| `rule_range` | 规则温度范围 | 读数温度超出规则 `temp_min/max_c` |
+
+任一门控失败，分区 `status=pending`、`risk_level=unknown`，不输出循环结论，
+`gaps` 列出可操作的缺口说明；分析同时给出逐缺口的补测/改绑建议。
+
+### 微气候修订（独立修订账，留理由派生修订）
+
+* `rebind_sensor`：`{sensor_id, zone_id}` —— 改绑分区（几何外改绑须说明现场理由）；
+* `unbind_sensor`：`{sensor_id}` —— 解除显式归属，回到几何落区；
+* `adopt_sensor`：`{zone_id, sensor_id}` —— 多解/多序列时指定采用序列；
+* `adopt_conservative_rule`：`{zone_id, rule_id, ...阈值覆盖}` —— 从已登记规则
+  **派生保守规则**（id 后缀 `_conservative`）：DRH 只许下调、CRH 只许下调（滞回带
+  只许加宽）、温区只许放宽、最短湿润时长只许缩短；任何收紧方向被拒绝。
+
+### 确认版
+
+`POST /monitors/{id}/confirm` 冻结分区/传感器/校准/规则目录、全部读数、微气候修订账
+（含改绑与派生保守规则）与引用来源（版本号 + 内容哈希 + 结论），生成：
+
+* `zones.json` —— 逐区门控、跨阈事件、完整/不完整循环、短时回返、开口湿润、最长
+  湿润段、首风险时刻与建议全量 JSON，含 `input_hash` / `params_hash` /
+  `confirm_hash`；用 `fresco_salt.microclimate_recompute.verify()` 离线复算比对；
+* `risk.svg` —— 三面板：逐区 RH 曲线叠 DRH/CRH 阈值（断点断开、待判灰色）、
+  逐区循环/湿润段统计条、门控缺口列表。
+
+确认版后监测计划任何写操作返回 `409`；需要变更时应新建监测计划。
+
 ## 模块布局
 
 ```
@@ -204,9 +321,13 @@ fresco_salt/
   poultice.py           敷贴试验核算：配对、逐轮浸出、库存/漂移、收支、深层、判定（纯函数）
   poultice_svg.py       离子收支 SVG
   poultice_recompute.py 试验确认版 JSON 与哈希校验
+  microclimate.py       微气候循环：映射、校准/单位/时序核查、潮解—析晶滞回状态机（纯函数）
+  microclimate_svg.py   风险曲线 SVG
+  microclimate_recompute.py 微气候确认版 JSON 与哈希校验
   db.py                 SQLite 持久化（walls/samples/rains/repairs/revisions/versions
-                        + trials/trial_rounds/trial_revisions/trial_versions）
+                        + trials/trial_rounds/trial_revisions/trial_versions
+                        + monitors/monitor_readings/monitor_revisions/monitor_versions）
   app.py                http.server 路由、录入校验、服务装配与 CLI
-  demo.py               端到端演示（含敷贴试验场景）
-tests/                  核心逻辑测试 + HTTP 端到端测试 + 敷贴试验测试
+  demo.py               端到端演示（含敷贴试验与微气候循环场景）
+tests/                  核心逻辑测试 + HTTP 端到端测试 + 敷贴/微气候测试
 ```

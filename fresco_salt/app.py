@@ -15,6 +15,13 @@ from . import __version__
 from .analysis import review
 from .chemistry import SUPPORTED_UNITS, IONS
 from .db import Store
+from .microclimate import (
+    MICROCLIMATE_DEFAULTS, TEMP_UNITS, RH_UNITS, analyze_monitor,
+    derive_conservative_rule, point_in_zone, validate_rule,
+)
+from .microclimate_recompute import build_confirm as build_micro_confirm
+from .microclimate_recompute import serialize as serialize_micro_confirm
+from .microclimate_svg import render_risk_svg
 from .poultice import analyze_trial
 from .poultice_recompute import build_confirm
 from .poultice_recompute import serialize as serialize_confirm
@@ -27,6 +34,8 @@ REVISION_KINDS = {"exclude_sample", "restore_sample", "correct_binding",
                   "adopt_conservative"}
 TRIAL_REVISION_KINDS = {"exclude_extract", "restore_extract",
                         "rebind_sample", "unbind_sample"}
+MONITOR_REVISION_KINDS = {"rebind_sensor", "unbind_sensor", "adopt_sensor",
+                          "adopt_conservative_rule"}
 
 
 class ApiError(Exception):
@@ -294,6 +303,218 @@ def validate_trial_revision(body: Dict[str, Any], trial: Dict[str, Any],
     return body
 
 
+# ---------------------------------------------------------------- 微气候监测校验
+
+def _validate_micro_zone(z: Dict[str, Any], wall: Dict[str, Any],
+                         seen: set, i: int) -> None:
+    _require(z, ["zone_id"], f"第 {i+1} 分区")
+    if z["zone_id"] in seen:
+        raise ApiError(400, f"分区 id 重复：{z['zone_id']}")
+    seen.add(z["zone_id"])
+    has_rect = all(k in z for k in ("x_mm", "y_mm", "width_mm", "height_mm"))
+    has_circle = all(k in z for k in ("x_mm", "y_mm", "radius_mm"))
+    if not has_rect and not has_circle:
+        raise ApiError(400, f"分区 {z['zone_id']} 须为矩形"
+                            "（x_mm/y_mm/width_mm/height_mm）或圆形（x_mm/y_mm/radius_mm）")
+    for k in ("x_mm", "y_mm"):
+        if not isinstance(z.get(k), (int, float)):
+            raise ApiError(400, f"分区 {z['zone_id']}.{k} 必须为数值（毫米）")
+    if has_rect:
+        for k in ("width_mm", "height_mm"):
+            if not isinstance(z.get(k), (int, float)) or z[k] <= 0:
+                raise ApiError(400, f"分区 {z['zone_id']}.{k} 必须为正数")
+        if not (0 <= z["x_mm"] <= wall["width_mm"]
+                and 0 <= z["y_mm"] <= wall["height_mm"]
+                and z["x_mm"] + z["width_mm"] <= wall["width_mm"]
+                and z["y_mm"] + z["height_mm"] <= wall["height_mm"]):
+            raise ApiError(400, f"分区 {z['zone_id']} 越出墙面范围")
+    else:
+        if not isinstance(z.get("radius_mm"), (int, float)) or z["radius_mm"] <= 0:
+            raise ApiError(400, f"分区 {z['zone_id']}.radius_mm 必须为正数")
+        if not (0 <= z["x_mm"] <= wall["width_mm"]
+                and 0 <= z["y_mm"] <= wall["height_mm"]):
+            raise ApiError(400, f"分区 {z['zone_id']} 圆心越出墙面")
+
+
+def _validate_calibration(c: Dict[str, Any]) -> None:
+    for k in ("calibrated_ts", "valid_until_ts"):
+        try:
+            parse_dt(c[k])
+        except (KeyError, ValueError, TypeError):
+            raise ApiError(400, f"校准记录缺合法 {k}")
+    if parse_dt(c["valid_until_ts"]) <= parse_dt(c["calibrated_ts"]):
+        raise ApiError(400, "校准 valid_until_ts 必须晚于 calibrated_ts")
+    for k in ("temp_offset_c", "rh_offset_pct"):
+        if k in c and not isinstance(c[k], (int, float)):
+            raise ApiError(400, f"校准 {k} 必须为数值")
+
+
+def validate_monitor(body: Dict[str, Any], wall: Dict[str, Any],
+                     store: Store) -> Dict[str, Any]:
+    _require(body, ["name", "source_version_id", "zones", "sensors", "rules"],
+             "微气候监测计划")
+    # 来源必须是已封版：v_*=来源复核封版，tv_*=敷贴试验确认版
+    src_kind = body.get("source_kind", "review")
+    if src_kind == "review":
+        src = store.get_version(body["source_version_id"])
+        if not src or src["wall_id"] != wall["wall_id"]:
+            raise ApiError(400, f"引用的来源复核封版 {body['source_version_id']!r} "
+                                "不存在或不属于该墙体，请先 /lock 封版")
+    elif src_kind == "trial":
+        src = store.get_trial_version(body["source_version_id"])
+        if not src:
+            raise ApiError(400, f"引用的敷贴试验确认版 {body['source_version_id']!r} 不存在")
+        t = store.get_trial(src["trial_id"])
+        if not t or t["wall_id"] != wall["wall_id"]:
+            raise ApiError(400, "引用的敷贴试验确认版不属于该墙体")
+    else:
+        raise ApiError(400, "source_kind 仅允许 review（来源复核封版）/ trial（敷贴确认版）")
+
+    zones, sensors, rules = body["zones"], body["sensors"], body["rules"]
+    if not isinstance(zones, list) or not zones:
+        raise ApiError(400, "zones 必须为非空数组（按墙面分区）")
+    seen_zones: set = set()
+    for i, z in enumerate(zones):
+        _validate_micro_zone(z, wall, seen_zones, i)
+    if not isinstance(sensors, list) or not sensors:
+        raise ApiError(400, "sensors 必须为非空数组（温湿度传感器）")
+    seen_sensors: set = set()
+    for i, s in enumerate(sensors):
+        _require(s, ["sensor_id", "x_mm", "y_mm"], f"第 {i+1} 传感器")
+        if s["sensor_id"] in seen_sensors:
+            raise ApiError(400, f"sensor_id 重复：{s['sensor_id']}")
+        seen_sensors.add(s["sensor_id"])
+        if not isinstance(s["x_mm"], (int, float)) or not isinstance(s["y_mm"], (int, float)):
+            raise ApiError(400, f"传感器 {s['sensor_id']} 坐标必须为数值")
+        if not (0 <= s["x_mm"] <= wall["width_mm"]
+                and 0 <= s["y_mm"] <= wall["height_mm"]):
+            raise ApiError(400, f"传感器 {s['sensor_id']} 坐标越出墙面")
+        if s.get("zone_id") and s["zone_id"] not in seen_zones:
+            raise ApiError(400, f"传感器 {s['sensor_id']} 声明分区 "
+                                f"{s['zone_id']!r} 不在分区表中")
+        if s.get("temp_unit", "C") not in TEMP_UNITS:
+            raise ApiError(400, f"传感器 {s['sensor_id']} 温度单位仅允许 {TEMP_UNITS}")
+        if s.get("rh_unit", "%") not in RH_UNITS:
+            raise ApiError(400, f"传感器 {s['sensor_id']} 湿度单位仅允许 {RH_UNITS}")
+        cals = s.get("calibrations") or s.get("calibration_list")
+        if not cals:
+            raise ApiError(400, f"传感器 {s['sensor_id']} 必须至少登记一条校准记录 "
+                                "(calibrated_ts/valid_until_ts)")
+        if not isinstance(cals, list):
+            raise ApiError(400, "calibrations 必须为数组")
+        for c in cals:
+            _require(c, ["calibrated_ts", "valid_until_ts"], f"传感器 {s['sensor_id']} 校准")
+            _validate_calibration(c)
+    if not isinstance(rules, list) or not rules:
+        raise ApiError(400, "rules 必须为非空数组（盐类潮解/析晶规则）")
+    rule_ids: set = set()
+    for r in rules:
+        _require(r, ["rule_id", "salt", "drh_percent", "crh_percent", "temp_min_c",
+                     "temp_max_c", "min_wet_hours", "min_dry_hours"], "盐类规则")
+        if r["rule_id"] in rule_ids:
+            raise ApiError(400, f"rule_id 重复：{r['rule_id']}")
+        rule_ids.add(r["rule_id"])
+        try:
+            validate_rule(r)
+        except ValueError as exc:
+            raise ApiError(400, str(exc))
+        for k in ("drh_percent", "crh_percent", "temp_min_c", "temp_max_c",
+                  "min_wet_hours", "min_dry_hours"):
+            if not isinstance(r[k], (int, float)):
+                raise ApiError(400, f"规则 {r['rule_id']}.{k} 必须为数值")
+    zs = body.get("zone_salts")
+    if zs:
+        if not isinstance(zs, list):
+            raise ApiError(400, "zone_salts 必须为数组（{zone_id, rule_id}）")
+        for q in zs:
+            _require(q, ["zone_id", "rule_id"], "zone_salts")
+            if q["zone_id"] not in seen_zones:
+                raise ApiError(400, f"zone_salts 引用未知分区 {q['zone_id']!r}")
+            if q["rule_id"] not in rule_ids:
+                raise ApiError(400, f"zone_salts 引用未知规则 {q['rule_id']!r}")
+    if "params" in body and not isinstance(body["params"], dict):
+        raise ApiError(400, "params 必须为对象")
+    return body
+
+
+def validate_reading(body: Dict[str, Any], sensor_ids: set) -> Dict[str, Any]:
+    _require(body, ["sensor_id", "ts"], "传感器读数")
+    if body["sensor_id"] not in sensor_ids:
+        raise ApiError(400, f"传感器 {body['sensor_id']} 不在监测计划中")
+    try:
+        parse_dt(body["ts"])
+    except (ValueError, TypeError):
+        raise ApiError(400, "ts 必须为 ISO8601 时间")
+    if "temp" in body and body["temp"] is not None and not isinstance(body["temp"], (int, float)):
+        raise ApiError(400, "temp 必须为数值或 null（缺测）")
+    if "rh" in body and body["rh"] is not None and not isinstance(body["rh"], (int, float)):
+        raise ApiError(400, "rh 必须为数值或 null（缺测）")
+    if body.get("temp_unit") and body["temp_unit"] not in TEMP_UNITS:
+        raise ApiError(400, f"temp_unit 仅允许 {TEMP_UNITS}，混录将判单位冲突待判")
+    if body.get("rh_unit") and body["rh_unit"] not in RH_UNITS:
+        raise ApiError(400, f"rh_unit 仅允许 {RH_UNITS}，混录将判单位冲突待判")
+    if "rh" in body and body["rh"] is not None:
+        unit = body.get("rh_unit", "%")
+        if unit == "%" and not 0 <= body["rh"] <= 100:
+            raise ApiError(400, "rh 以 % 记录时必须在 0~100")
+        if unit == "fraction" and not 0 <= body["rh"] <= 1:
+            raise ApiError(400, "rh 以 fraction 记录时必须在 0~1")
+    return body
+
+
+def validate_monitor_revision(body: Dict[str, Any], monitor: Dict[str, Any]
+                              ) -> Dict[str, Any]:
+    _require(body, ["kind", "reason", "payload"], "微气候修订")
+    if body["kind"] not in MONITOR_REVISION_KINDS:
+        raise ApiError(400, f"kind 必须为 {sorted(MONITOR_REVISION_KINDS)}")
+    if not str(body["reason"]).strip():
+        raise ApiError(400, "每次改绑/采用保守规则必须留理由 reason")
+    p = body["payload"]
+    if not isinstance(p, dict):
+        raise ApiError(400, "payload 必须为对象")
+    zone_ids = {z["zone_id"] for z in monitor["zones"]}
+    sensor_ids = {s["sensor_id"] for s in monitor["sensors"]}
+    rules = {r["rule_id"]: r for r in monitor["rules"]}
+    if body["kind"] in ("rebind_sensor", "unbind_sensor"):
+        _require(p, ["sensor_id"], "payload")
+        if p["sensor_id"] not in sensor_ids:
+            raise ApiError(400, f"传感器 {p['sensor_id']} 不在监测计划中")
+    if body["kind"] == "rebind_sensor":
+        _require(p, ["zone_id"], "payload")
+        if p["zone_id"] not in zone_ids:
+            raise ApiError(400, f"目标分区 {p['zone_id']} 不在监测计划中")
+        sensor = next(s for s in monitor["sensors"]
+                      if s["sensor_id"] == p["sensor_id"])
+        target = next(z for z in monitor["zones"] if z["zone_id"] == p["zone_id"])
+        if not point_in_zone(target, sensor["x_mm"], sensor["y_mm"]):
+            if not str(body["reason"]).strip() or len(str(body["reason"]).strip()) < 6:
+                raise ApiError(400, "改绑到几何范围之外的分区时，理由必须说明现场布设/"
+                                    "迁移依据（不少于 6 字）")
+    if body["kind"] == "adopt_sensor":
+        _require(p, ["zone_id", "sensor_id"], "payload")
+        if p["zone_id"] not in zone_ids:
+            raise ApiError(400, f"分区 {p['zone_id']} 不存在")
+        if p["sensor_id"] not in sensor_ids:
+            raise ApiError(400, f"传感器 {p['sensor_id']} 不存在")
+    if body["kind"] == "adopt_conservative_rule":
+        _require(p, ["zone_id", "rule_id"], "payload")
+        if p["zone_id"] not in zone_ids:
+            raise ApiError(400, f"分区 {p['zone_id']} 不存在")
+        if p["rule_id"] not in rules:
+            raise ApiError(400, f"基础规则 {p['rule_id']} 不在监测计划规则目录中；"
+                                "保守规则只能从已封版登记的规则派生")
+        params = dict(MICROCLIMATE_DEFAULTS)
+        params.update(monitor.get("params") or {})
+        override = {k: p[k] for k in ("drh_percent", "crh_percent", "temp_min_c",
+                                      "temp_max_c", "min_wet_hours", "min_dry_hours")
+                    if k in p}
+        try:
+            derive_conservative_rule(rules[p["rule_id"]], override, params)
+        except ValueError as exc:
+            raise ApiError(400, f"保守派生规则不合法：{exc}")
+    return body
+
+
 # ---------------------------------------------------------------- 服务
 
 class SaltApiApp:
@@ -313,7 +534,7 @@ class SaltApiApp:
 
     # GET ------------------------------------------------------------------
     def health(self) -> Dict[str, Any]:
-        return {"status": "ok", "service": "fresco-salt-review", "version": __version__}
+        return {"status": "ok", "service": "fresco-salt-review", "subservice": "microclimate-cycles", "version": __version__}
 
     def list_walls(self) -> Dict[str, Any]:
         return {"walls": self.store.list_walls()}
@@ -540,6 +761,161 @@ class SaltApiApp:
                             "can_end": result["decision"]["can_end"]},
                            ensure_ascii=False), None)
 
+    # 微气候监测 -------------------------------------------------------------
+    def _monitor_or_404(self, monitor_id: str) -> Dict[str, Any]:
+        m = self.store.get_monitor(monitor_id)
+        if not m:
+            raise ApiError(404, f"微气候监测计划 {monitor_id} 不存在")
+        return m
+
+    def _source_info(self, monitor: Dict[str, Any]) -> Dict[str, Any]:
+        """解析引用的已封版来源：v_*=来源复核，tv_*=敷贴确认版。
+
+        只有唯一盐源（unique_source）或净移除（net_removal）才算“有结论”，
+        否则来源版仍无结论，分区保持待判。
+        """
+        svid = monitor["source_version_id"]
+        kind = monitor.get("source_kind", "review")
+        if kind == "trial":
+            v = self.store.get_trial_version(svid)
+            if not v:
+                return {"kind": "trial", "kind_name": "敷贴试验确认版",
+                        "version_id": svid, "hash": None, "summary": "来源缺失",
+                        "decisive": False}
+            result = v["confirm"]["result"]
+            cls = result["classification"]
+            return {"kind": "trial", "kind_name": "敷贴试验确认版",
+                    "version_id": svid, "hash": v["confirm"]["confirm_hash"],
+                    "summary": f"{result['classification_name']}｜"
+                               f"{result['decision']['name']}",
+                    "classification": cls,
+                    "decision": result["decision"]["code"],
+                    "decisive": cls == "net_removal"}
+        v = self.store.get_version(svid)
+        if not v:
+            return {"kind": "review", "kind_name": "来源复核封版",
+                    "version_id": svid, "hash": None, "summary": "来源缺失",
+                    "decisive": False}
+        result = v["recompute"]["result"]
+        return {"kind": "review", "kind_name": "来源复核封版",
+                "version_id": svid, "hash": v["recompute"]["recompute_hash"],
+                "summary": result.get("verdict_reason", result["verdict"]),
+                "verdict": result["verdict"],
+                "unique_source": result.get("unique_source"),
+                "unique_source_name": result.get("unique_source_name"),
+                "decisive": result["verdict"] == "unique_source"}
+
+    def _run_monitor_analysis(self, monitor_id: str) -> Dict[str, Any]:
+        monitor = self._monitor_or_404(monitor_id)
+        wall = self.store.get_wall(monitor["wall_id"])
+        b = self.store.monitor_bundle(monitor_id)
+        source = self._source_info(monitor)
+        return analyze_monitor(wall, monitor, b["readings"], b["revisions"], source)
+
+    def create_monitor(self, wall_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        wall = self._wall_or_404(wall_id)
+        model = validate_monitor(body, wall, self.store)
+        return {"monitor": self.store.create_monitor(wall_id, model)}
+
+    def list_monitors(self, wall_id: str) -> Dict[str, Any]:
+        self._wall_or_404(wall_id)
+        return {"wall_id": wall_id, "monitors": self.store.list_monitors(wall_id)}
+
+    def get_monitor(self, monitor_id: str) -> Dict[str, Any]:
+        monitor = self._monitor_or_404(monitor_id)
+        b = self.store.monitor_bundle(monitor_id)
+        return {"monitor": monitor,
+                "counts": {"readings": len(b["readings"]),
+                           "revisions": len(b["revisions"])}}
+
+    def add_readings(self, monitor_id: str, body: Any) -> Dict[str, Any]:
+        monitor = self._monitor_or_404(monitor_id)
+        self.store.assert_monitor_unlocked(monitor_id)
+        items = body if isinstance(body, list) else body.get("readings")
+        if not isinstance(items, list) or not items:
+            raise ApiError(400, "请提交 readings 数组")
+        sensor_ids = {s["sensor_id"] for s in monitor["sensors"]}
+        cleaned = [validate_reading(dict(it), sensor_ids) for it in items]
+        return {"reading_ids": self.store.add_readings(monitor_id, cleaned)}
+
+    def get_monitor_analysis(self, monitor_id: str) -> Dict[str, Any]:
+        monitor = self._monitor_or_404(monitor_id)
+        return {"monitor_id": monitor_id, "locked": monitor.get("_locked", False),
+                "analysis": self._run_monitor_analysis(monitor_id)}
+
+    def get_monitor_revisions(self, monitor_id: str) -> Dict[str, Any]:
+        self._monitor_or_404(monitor_id)
+        return {"monitor_id": monitor_id,
+                "revisions": self.store.get_monitor_revisions(monitor_id)}
+
+    def add_monitor_revision(self, monitor_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        monitor = self._monitor_or_404(monitor_id)
+        self.store.assert_monitor_unlocked(monitor_id)
+        body = validate_monitor_revision(body, monitor)
+        rev = self.store.add_monitor_revision(monitor_id, body["kind"], body["reason"],
+                                              body["payload"], body.get("actor"))
+        result = self._run_monitor_analysis(monitor_id)
+        return {"revision": rev,
+                "note": "已生成微气候修订；以下为应用修订后的即时循环分析（未确认封版）",
+                "n_pending": result["n_pending"],
+                "analysis": result}
+
+    def confirm_monitor(self, monitor_id: str, body: Any) -> Dict[str, Any]:
+        monitor = self._monitor_or_404(monitor_id)
+        self.store.assert_monitor_unlocked(monitor_id)
+        if not isinstance(body, dict):
+            body = {}
+        wall = self.store.get_wall(monitor["wall_id"])
+        b = self.store.monitor_bundle(monitor_id)
+        source = self._source_info(monitor)
+        confirm = build_micro_confirm(wall, monitor, b["readings"],
+                                      b["revisions"], source)
+        version_id = confirm["version_id"]
+        confirm["confirmed_by"] = body.get("actor")
+        svg = render_risk_svg(monitor, confirm["result"])
+        self.store.save_monitor_version(version_id, monitor_id, confirm, svg)
+        result = confirm["result"]
+        assessed = [z for z in result["zones"] if z["status"] == "assessed"]
+        return {"version_id": version_id, "monitor_id": monitor_id, "locked": True,
+                "source_version_id": monitor["source_version_id"],
+                "source_kind": monitor.get("source_kind", "review"),
+                "input_hash": confirm["input_hash"],
+                "params_hash": confirm["params_hash"],
+                "confirm_hash": confirm["confirm_hash"],
+                "n_pending": result["n_pending"],
+                "n_assessed": result["n_assessed"],
+                "assessed_summary": [{"zone_id": z["zone_id"],
+                                      "risk_level": z["risk_level"],
+                                      "n_complete_cycles": z["n_complete_cycles"]}
+                                     for z in assessed],
+                "zones_json": f"/microclimate-versions/{version_id}/zones.json",
+                "risk_svg": f"/microclimate-versions/{version_id}/risk.svg"}
+
+    def list_monitor_versions(self, monitor_id: str) -> Dict[str, Any]:
+        self._monitor_or_404(monitor_id)
+        return {"monitor_id": monitor_id,
+                "versions": self.store.list_monitor_versions(monitor_id)}
+
+    def get_monitor_version(self, version_id: str, suffix: str
+                            ) -> Tuple[str, str, Any]:
+        v = self.store.get_monitor_version(version_id)
+        if not v:
+            raise ApiError(404, f"微气候确认版 {version_id} 不存在")
+        if suffix == "/zones.json":
+            return "application/json", serialize_micro_confirm(v["confirm"]), None
+        if suffix == "/risk.svg":
+            return "image/svg+xml", v["svg"], None
+        result = v["confirm"]["result"]
+        return ("application/json",
+                json.dumps({"version_id": version_id,
+                            "monitor_id": v["monitor_id"],
+                            "created_ts": v["created_ts"],
+                            "confirm_hash": v["confirm"]["confirm_hash"],
+                            "source_version_id": v["confirm"]["source"]["version_id"],
+                            "n_pending": result["n_pending"],
+                            "n_assessed": result["n_assessed"]},
+                           ensure_ascii=False), None)
+
 
 # 路由表：(method, pattern_kind) -> handler 名
 class Handler(BaseHTTPRequestHandler):
@@ -646,6 +1022,10 @@ class Handler(BaseHTTPRequestHandler):
                 return "application/json", None, app.create_trial(wid, body)
             if method == "GET" and sub == "/trials":
                 return "application/json", None, app.list_trials(wid)
+            if method == "POST" and sub == "/monitors":
+                return "application/json", None, app.create_monitor(wid, body)
+            if method == "GET" and sub == "/monitors":
+                return "application/json", None, app.list_monitors(wid)
         # /trials/{id}...
         if len(parts) >= 2 and parts[0] == "trials":
             tid = parts[1]
@@ -666,6 +1046,31 @@ class Handler(BaseHTTPRequestHandler):
                 return "application/json", None, app.confirm_trial(tid, body)
             if method == "GET" and sub == "/versions":
                 return "application/json", None, app.list_trial_versions(tid)
+        # /monitors/{id}...
+        if len(parts) >= 2 and parts[0] == "monitors":
+            mid = parts[1]
+            sub = "/" + "/".join(parts[2:])
+            if method == "GET" and sub == "":
+                return "application/json", None, app.get_monitor(mid)
+            if method == "POST" and sub == "/readings":
+                return "application/json", None, app.add_readings(mid, body)
+            if method == "GET" and sub == "/analysis":
+                return "application/json", None, app.get_monitor_analysis(mid)
+            if method == "POST" and sub == "/analysis":
+                return "application/json", None, app.get_monitor_analysis(mid)
+            if method == "GET" and sub == "/revisions":
+                return "application/json", None, app.get_monitor_revisions(mid)
+            if method == "POST" and sub == "/revisions":
+                return "application/json", None, app.add_monitor_revision(mid, body)
+            if method == "POST" and sub == "/confirm":
+                return "application/json", None, app.confirm_monitor(mid, body)
+            if method == "GET" and sub == "/versions":
+                return "application/json", None, app.list_monitor_versions(mid)
+        # /microclimate-versions/{id}[/zones.json|/risk.svg]
+        if len(parts) >= 2 and parts[0] == "microclimate-versions" and method == "GET":
+            vid = parts[1]
+            suffix = "/" + "/".join(parts[2:]) if len(parts) > 2 else ""
+            return app.get_monitor_version(vid, suffix)
         # /trial-versions/{id}[/rounds.json|/balance.svg]
         if len(parts) >= 2 and parts[0] == "trial-versions" and method == "GET":
             vid = parts[1]
