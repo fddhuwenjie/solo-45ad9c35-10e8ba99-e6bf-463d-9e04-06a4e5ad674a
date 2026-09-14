@@ -140,6 +140,8 @@ class PoulticeAnalysisTests(unittest.TestCase):
                                613.875, places=2)
         self.assertTrue(r["balance"]["closed"])
         self.assertTrue(r["balance"]["total"]["closed"])
+        self.assertTrue(r["balance"]["total_closed"])
+        self.assertEqual(r["balance"]["open_ions"], [])
         # 深层 L3：100 → 90，未升高
         deep = {d["layer_id"]: d for d in r["deep_layers"]}
         self.assertIn("L3", deep)
@@ -207,6 +209,42 @@ class PoulticeAnalysisTests(unittest.TestCase):
         self.assertFalse(g["balance"]["passed"])
         self.assertIn("不闭合", g["balance"]["detail"])
         self.assertEqual(r["classification"], "insufficient_evidence")
+        self.assertFalse(r["decision"]["can_end"])
+
+    def test_canceling_ion_residuals_block_end(self):
+        """回归：Na+ 正残差与 Cl- 负残差相互抵消、总量闭合——分项不闭合仍须拦截。
+
+        浸出 Na+ 260 / Cl- 60 mmol/L × 3 轮 × 0.5L：累计 Na+ 390、Cl- 90 mmol，
+        分项残差 +142.35 / -157.65 mmol 各自超容差，但总量残差 -13.875 mmol
+        与全部闭合时完全相同——旧逻辑只看总量会误判净移除并放行结束处理。
+        """
+        def split_round(rid, start, end):
+            return {"round_id": rid, "cover_start_ts": start, "cover_end_ts": end,
+                    "extract": {"volume_l": 0.5, "ions": {
+                        "Na+": {"value": 260, "unit": "mmol/L", "lod": 0.2},
+                        "Cl-": {"value": 60, "unit": "mmol/L", "lod": 0.2},
+                        "Ca2+": {"value": 40, "unit": "mmol/L", "lod": 0.2},
+                        "SO42-": {"value": 40, "unit": "mmol/L", "lod": 0.2}}}}
+
+        rr = [split_round("R1", "2026-07-01T09:00:00", "2026-07-03T09:00:00"),
+              split_round("R2", "2026-07-08T09:00:00", "2026-07-10T09:00:00"),
+              split_round("R3", "2026-07-15T09:00:00", "2026-07-17T09:00:00")]
+        r = run(rounds=rr)
+        # 总量确实闭合（与 test_net_removal_continue 相同的 -13.875 mmol），
+        # 拦截只能来自分项判定
+        self.assertTrue(r["balance"]["total_closed"])
+        self.assertAlmostEqual(r["balance"]["total"]["residual_mmol"],
+                               -13.875, places=2)
+        # Na+ / Cl- 分项残差相互抵消，各自超容差
+        self.assertFalse(r["balance"]["closed"])
+        self.assertEqual(set(r["balance"]["open_ions"]), {"Na+", "Cl-"})
+        g = gates_map(r)
+        self.assertFalse(g["balance"]["passed"])
+        self.assertIn("分项", g["balance"]["detail"])
+        self.assertIn("Na+", g["balance"]["detail"])
+        self.assertIn("Cl-", g["balance"]["detail"])
+        self.assertEqual(r["classification"], "insufficient_evidence")
+        self.assertEqual(r["decision"]["code"], "hold_insufficient_evidence")
         self.assertFalse(r["decision"]["can_end"])
 
     def test_deep_rise_means_inward_migration(self):

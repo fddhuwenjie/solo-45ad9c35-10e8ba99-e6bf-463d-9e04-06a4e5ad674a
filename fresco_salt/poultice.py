@@ -325,6 +325,8 @@ def compute_balance(inv: Dict[str, Any], drift: Dict[str, float],
     """离子收支：累计浸出移出量 vs 漂移校正后的墙内净减（正=离墙）。
 
     loss_corr = 处理前库存 × 对照漂移比 − 处理后库存；residual = 浸出 − 净减。
+    闭合判定：总量闭合只是必要条件——**任一离子的分项残差超容差即不闭合**，
+    防止正/负分项残差相互抵消（如 Na+ 多浸出、Cl− 少浸出，加总后假装闭合）。
     """
     ions = sorted(set(cumulative) | set(inv["treatment"]["pre"])
                   | set(inv["treatment"]["post"]))
@@ -349,11 +351,14 @@ def compute_balance(inv: Dict[str, Any], drift: Dict[str, float],
         loss_t += loss
         res_t += res
     scale_t = max(abs(ext_t), abs(loss_t), 1e-9)
+    total_closed = abs(res_t) <= tol * scale_t
+    open_ions = [ion for ion in ions if not per_ion[ion]["closed"]]
     return {"per_ion": per_ion,
             "total": {"extract_mmol": ext_t, "loss_corr_mmol": loss_t,
-                      "residual_mmol": res_t,
-                      "closed": abs(res_t) <= tol * scale_t},
-            "closed": abs(res_t) <= tol * scale_t,
+                      "residual_mmol": res_t, "closed": total_closed},
+            "total_closed": total_closed,
+            "open_ions": open_ions,
+            "closed": total_closed and not open_ions,
             "tolerance": tol, "drift_assumed": assumed}
 
 
@@ -516,12 +521,23 @@ def analyze_trial(wall: Dict[str, Any], trial: Dict[str, Any],
             elif code == "balance":
                 if not balance_computable:
                     detail = "缺处理区配对样本或有效轮次，收支无法核算"
+                elif not balance["closed"]:
+                    lack = []
+                    if balance["open_ions"]:
+                        lack.append("分项收支不闭合：" + "、".join(
+                            f"{ion}（残差 "
+                            f"{r4(balance['per_ion'][ion]['residual_mmol'])} mmol）"
+                            for ion in balance["open_ions"]))
+                    if not balance["total_closed"]:
+                        t = balance["total"]
+                        lack.append(f"总量不闭合：累计浸出 {r4(t['extract_mmol'])} "
+                                    f"mmol 与漂移校正后墙内净减 "
+                                    f"{r4(t['loss_corr_mmol'])} mmol 残差 "
+                                    f"{r4(t['residual_mmol'])} mmol"
+                                    f"（容差 ±{p['balance_tolerance']:.0%}）")
+                    detail = "；".join(lack)
                 else:
-                    t = balance["total"]
-                    detail = (f"累计浸出 {r4(t['extract_mmol'])} mmol 与漂移校正后"
-                              f"墙内净减 {r4(t['loss_corr_mmol'])} mmol 不闭合"
-                              f"（残差 {r4(t['residual_mmol'])} mmol，容差 "
-                              f"±{p['balance_tolerance']:.0%}）")
+                    detail = "浸出液基准或检测限问题未决，收支账不可信"
             elif code == "deep_rise":
                 if not deep_computable:
                     detail = (f"深层（≥{p['deep_layer_min_depth_mm']:.0f}mm）无配对"
@@ -676,6 +692,8 @@ def analyze_trial(wall: Dict[str, Any], trial: Dict[str, Any],
         "balance": {
             "tolerance": balance["tolerance"],
             "closed": balance["closed"],
+            "total_closed": balance["total_closed"],
+            "open_ions": balance["open_ions"],
             "drift_assumed": balance["drift_assumed"],
             "per_ion": {ion: {k: (r4(v) if isinstance(v, (int, float)) else v)
                               for k, v in row.items()}
