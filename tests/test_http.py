@@ -172,6 +172,41 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(g["time"]["passed"])
         self.assertNotEqual(res["analysis"]["verdict"], "unique_source")
 
+    def test_04b_declared_wet_conflict_blocks_lock_unique(self):
+        # 申报 wet 但雨后 3850h（推断 dry）：经 API 复核不得返回唯一盐源，
+        # 即使封版，封版产物中的裁决也必须是无法区分/多候选。
+        import datetime as _dt
+        st, res = body("POST", f"{self.base}/walls", dict(WALL, name="阶段冲突墙"))
+        wid2 = res["wall"]["wall_id"]
+        ts = (_dt.datetime(2026, 6, 9, 2) + _dt.timedelta(hours=3850)).isoformat()
+        samples = rising_samples()
+        for x in samples:
+            if x["sample_id"].endswith("w"):
+                x["ts"] = ts
+                x["stage"] = "wet"
+        self.assertEqual(body("POST", f"{self.base}/walls/{wid2}/samples", samples)[0], 200)
+        self.assertEqual(body("POST", f"{self.base}/walls/{wid2}/rainfall",
+                              [{"ts": "2026-06-09T02:00:00", "rain_mm": 18}])[0], 200)
+        st, res = body("GET", f"{self.base}/walls/{wid2}/analysis")
+        g = {x["code"]: x for x in res["analysis"]["gates"]}
+        self.assertFalse(g["time"]["passed"])
+        self.assertIn("冲突", g["time"]["detail"])
+        self.assertNotEqual(res["analysis"]["verdict"], "unique_source")
+        conflicted = [a for a in res["analysis"]["samples"]["active"]
+                      if a["stage_conflict"]]
+        self.assertEqual(len(conflicted), 6)
+        self.assertTrue(all(a["stage"] == "dry" for a in conflicted))
+        advice = json.dumps(res["analysis"]["next_sampling"], ensure_ascii=False)
+        self.assertIn("冲突", advice)
+        # 封版产物同样保留降级裁决
+        st, locked = body("POST", f"{self.base}/walls/{wid2}/lock", {"actor": "乙"})
+        self.assertEqual(st, 200)
+        st, rec = body("GET",
+                       f"{self.base}/versions/{locked['version_id']}/recompute.json")
+        self.assertTrue(verify(rec))
+        self.assertNotEqual(rec["result"]["verdict"], "unique_source")
+        self.assertIsNone(rec["result"]["unique_source"])
+
     def test_05_unknown_route_and_bad_json(self):
         st, _ = body("GET", f"{self.base}/nope")
         self.assertEqual(st, 404)

@@ -1,5 +1,7 @@
 """核心复核引擎测试：门控、候选裁决、干湿、修订与封版语义。"""
+import json
 import unittest
+from datetime import timedelta
 
 from fresco_salt.analysis import (
     CANDIDATE_CN, DEFAULTS, infer_stage, review,
@@ -130,6 +132,63 @@ class GateTests(unittest.TestCase):
         r = review(WALL, s, RAINS, [])
         self.assertFalse(gates_map(r)["time"]["passed"])
         self.assertNotEqual(r["verdict"], "unique_source")
+
+    def test_declared_wet_inferred_dry_conflict_blocks_unique(self):
+        """申报 wet 但距降雨 3850/3851h（推断 dry）：冲突必须使 time 门控失败。
+
+        回归缺陷：旧逻辑在冲突时直接采用申报值，导致干季样本冒充雨后湿样本放行。
+        """
+        from fresco_salt.util import parse_dt
+        base = parse_dt(RAINS[0]["ts"])
+        for offset_h in (3850, 3851):
+            ts = (base + timedelta(hours=offset_h)).isoformat()
+            with self.subTest(offset_h=offset_h):
+                s = rising_set()
+                # 把原本雨后 32h 的湿样本全部改成 3850/3851h 后并申报 wet
+                wet_like = [x for x in s if x["sample_id"].endswith("w")]
+                self.assertEqual(len(wet_like), 6)
+                for x in wet_like:
+                    x["ts"] = ts
+                    x["stage"] = "wet"
+                r = review(WALL, s, RAINS, [])
+                g = gates_map(r)
+                self.assertFalse(
+                    g["time"]["passed"],
+                    f"offset={offset_h}h 时 time 门控不应通过：{g['time']['detail']}")
+                self.assertNotEqual(r["verdict"], "unique_source")
+                self.assertIsNone(r["unique_source"])
+                # 门控明细必须保留“冲突”说明，裁决只能是多候选/证据不足
+                self.assertIn("冲突", g["time"]["detail"])
+                # 冲突逐样本留痕：推断 dry、申报 wet，不得采用申报值
+                active = {x["sample_id"]: x for x in r["samples"]["active"]}
+                for x in wet_like:
+                    a = active[x["sample_id"]]
+                    self.assertEqual(a["stage"], "dry")
+                    self.assertEqual(a["stage_declared"], "wet")
+                    self.assertTrue(a["stage_conflict"])
+                    self.assertFalse(a["stage_gap"])
+                    self.assertIn("冲突", a["stage_note"])
+                    self.assertAlmostEqual(a["hours_after_rain"], offset_h, delta=1e-6)
+                # 裁决降级：保留多个候选或无法区分，而不是唯一盐源
+                self.assertIn(r["verdict"],
+                              ("indeterminate_multiple", "indeterminate_none"))
+                # 补样建议必须点名冲突样本并给出雨后/干季重采时点
+                text = json.dumps(r["next_sampling"], ensure_ascii=False)
+                self.assertIn("冲突", text)
+                self.assertIn("48", text)
+
+    def test_transition_gap_blocks_unique(self):
+        """雨后 72h（湿/干窗口之间）构成时序断档，不能计作湿或干样本。"""
+        s = rising_set()
+        for x in s:
+            if x["sample_id"].endswith("w"):
+                x["ts"] = "2026-06-12T02:00:00"  # 雨后恰好 72h
+        r = review(WALL, s, RAINS, [])
+        self.assertFalse(gates_map(r)["time"]["passed"])
+        self.assertNotEqual(r["verdict"], "unique_source")
+        flagged = [x for x in r["samples"]["active"] if x["stage_gap"]]
+        self.assertTrue(flagged)
+        self.assertIn("断档", gates_map(r)["time"]["detail"])
 
     def test_basis_gate(self):
         s = rising_set()

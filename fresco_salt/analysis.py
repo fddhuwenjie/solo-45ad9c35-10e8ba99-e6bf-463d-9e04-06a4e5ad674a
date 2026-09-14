@@ -214,14 +214,27 @@ def evaluate_sample(s: Dict[str, Any], wall: Dict[str, Any], p: Dict[str, Any],
             "basis" if "基准" in msg else "charge")
         issues.append({"code": code, "msg": f"{s['sample_id']}: {msg}"})
 
-    # 干湿阶段
+    # 干湿阶段：一律以降雨记录推断为准；申报值只用于对账，不得覆盖推断结果。
     ts = parse_dt(s["ts"])
-    stage, hours_after, rain_id = infer_stage(ts, rains, p)
-    explicit = s.get("stage")
+    inferred_stage, hours_after, rain_id = infer_stage(ts, rains, p)
+    declared_stage = s.get("stage")
+    stage_conflict = bool(declared_stage) and declared_stage != inferred_stage
+    # 推断为 transition：样本落在雨后湿/干窗口之间，或与任何有效降雨都无法对齐，
+    # 属于时序断档，不能充当湿阶段或干季基线样本。
+    stage_gap = inferred_stage == "transition"
     stage_note = None
-    if explicit and explicit != stage:
-        stage_note = f"申报阶段 {explicit} 与降雨记录推断 {stage} 不一致，已采用申报值"
-        stage = explicit
+    if stage_conflict:
+        gap_word = "（且采样落在雨后过渡窗口，构成时序断档）" if stage_gap else ""
+        stage_note = (f"申报阶段 {declared_stage} 与降雨记录推断 {inferred_stage} 冲突"
+                      f"{gap_word}；不采用申报值，该样本不得放行唯一盐源")
+    elif stage_gap:
+        if hours_after is None:
+            detail = "无有效降雨记录可对齐"
+        elif hours_after < 0:
+            detail = f"距其后首场有效降雨 {-hours_after:.0f}h，处于雨前过渡窗口"
+        else:
+            detail = f"雨后 {hours_after:.0f}h，处于湿/干窗口之间"
+        stage_note = f"时序断档：{detail}，样本不能计入湿/干阶段"
 
     total = sum(i.value for i in norm.values())
     return {
@@ -233,7 +246,10 @@ def evaluate_sample(s: Dict[str, Any], wall: Dict[str, Any], p: Dict[str, Any],
         "suggested_layer": suggested,
         "coord_ok": coord_ok,
         "ts": ts.isoformat(),
-        "stage": stage,
+        "stage": inferred_stage,
+        "stage_declared": declared_stage,
+        "stage_conflict": stage_conflict,
+        "stage_gap": stage_gap,
         "hours_after_rain": r4(hours_after),
         "nearest_rain_id": rain_id,
         "stage_note": stage_note,
@@ -556,6 +572,22 @@ def build_advice(gates: Dict[str, bool], scored, m, rows, wall, p) -> List[Dict[
                 "一个完整降雨周期内湿、干各采一次",
                 "x/y 归并尺度 %.0fmm，深度误差 ±%.0fmm" % (p["column_xy_bin_mm"],
                                                             p["depth_match_mm"]))
+        conflicts = [r for r in rows if r.get("stage_conflict")]
+        for r in conflicts:
+            add(f"复核申报/推断阶段冲突样本 {r['sample_id']}", "全部候选",
+                f"原位（x={r['x_mm']}, y={r['y_mm']}, 深 {r['depth_mm']}mm）",
+                f"下次有效降雨后 {p['wet_window_hours']:.0f}h 内与无雨 "
+                f"≥{p['dry_window_hours']:.0f}h 后各重采一次",
+                f"申报 {r['stage_declared']} 与降雨推断 {r['stage']} 冲突，"
+                "以降雨记录为准重采，不得用申报阶段放行")
+        gaps = [r for r in rows if r.get("stage_gap") and not r.get("stage_conflict")]
+        for r in gaps:
+            add(f"补齐时序断档样本 {r['sample_id']}", "全部候选",
+                f"原孔位（x={r['x_mm']}, y={r['y_mm']}, 深 {r['depth_mm']}mm）",
+                "避开雨后过渡窗口，改在湿窗口与干窗口内采样",
+                f"该样本雨后 {r['hours_after_rain']}h 落在 "
+                f"{p['wet_window_hours']:.0f}~{p['dry_window_hours']:.0f}h 过渡带，"
+                "不能计作湿或干")
     if not gates["charge"]:
         add("闭合电荷账", "全部候选", "对 CBE 超差与代用比例高的样本原位",
             "下次采样同步", "补测缺失极性离子，降低高占比离子的检测限")
@@ -615,9 +647,13 @@ def review(wall: Dict[str, Any], samples: List[Dict[str, Any]],
                  {"weight": 2, "text": "无有效样本"}]} for c in CANDIDATES} | {"_tie": None}
 
     paired = metrics.get("n_paired_wet_dry", 0) if metrics else 0
+    conflict_rows = [e for e in active if e.get("stage_conflict")]
+    gap_rows = [e for e in active if e.get("stage_gap")]
+    # time 门控：湿/干阶段均按降雨推断计数；任何样本存在申报冲突或时序断档都不得放行。
     time_ok = (stages.count("wet") >= p["min_wet_samples"]
                and stages.count("dry") >= p["min_dry_samples"]
-               and paired >= 1 and len(rains) >= 1)
+               and paired >= 1 and len(rains) >= 1
+               and not conflict_rows and not gap_rows)
     tie_ok = scored.get("_tie") is None
     gate_pass = {
         "layer_bind": "layer_bind" not in issue_codes,
@@ -639,13 +675,20 @@ def review(wall: Dict[str, Any], samples: List[Dict[str, Any]],
             elif code == "time":
                 lack = []
                 if stages.count("wet") < p["min_wet_samples"]:
-                    lack.append("缺雨后湿阶段样本")
+                    lack.append("缺雨后湿阶段样本（以降雨记录推断为准）")
                 if stages.count("dry") < p["min_dry_samples"]:
                     lack.append("缺干季基线样本")
                 if paired < 1:
                     lack.append("缺同孔位干湿配对（采样深度/雨后间隔未对齐）")
                 if not rains:
                     lack.append("无降雨记录")
+                for e in conflict_rows:
+                    lack.append(
+                        f"{e['sample_id']} 申报 {e['stage_declared']} 与降雨推断 "
+                        f"{e['stage']} 冲突，不采用申报值")
+                for e in gap_rows:
+                    lack.append(f"{e['sample_id']} 时序断档（推断 {e['stage']}，"
+                                f"雨后小时数 {e['hours_after_rain']}），不能计入湿/干阶段")
                 detail = "；".join(lack)
             elif code == "tie":
                 a, b = scored["_tie"]
@@ -717,6 +760,7 @@ def review(wall: Dict[str, Any], samples: List[Dict[str, Any]],
 def _public_sample(e: Dict[str, Any]) -> Dict[str, Any]:
     return {k: e[k] for k in (
         "sample_id", "layer_id", "x_mm", "y_mm", "z_mm", "depth_mm", "ts", "stage",
-        "hours_after_rain", "nearest_rain_id", "stage_note", "moisture_wt", "temp_c",
-        "rh_percent", "basis", "total_conc", "balance", "ions", "binding_ok",
-        "coord_ok", "suggested_layer", "issues")}
+        "stage_declared", "stage_conflict", "stage_gap", "hours_after_rain",
+        "nearest_rain_id", "stage_note", "moisture_wt", "temp_c", "rh_percent",
+        "basis", "total_conc", "balance", "ions", "binding_ok", "coord_ok",
+        "suggested_layer", "issues")}

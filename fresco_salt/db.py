@@ -26,10 +26,11 @@ CREATE TABLE IF NOT EXISTS walls (
     created_ts TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS samples (
-    sample_id TEXT PRIMARY KEY,
+    sample_id TEXT NOT NULL,
     wall_id TEXT NOT NULL REFERENCES walls(wall_id),
     data_json TEXT NOT NULL,
-    created_ts TEXT NOT NULL
+    created_ts TEXT NOT NULL,
+    PRIMARY KEY (sample_id, wall_id)
 );
 CREATE TABLE IF NOT EXISTS rains (
     rain_id TEXT PRIMARY KEY,
@@ -66,7 +67,23 @@ class Store:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate_samples_pk()
         self.conn.commit()
+
+    def _migrate_samples_pk(self):
+        """旧版本 samples 以 sample_id 为全局主键，迁移为 (sample_id, wall_id) 复合主键。"""
+        cols = self.conn.execute("PRAGMA table_info(samples)").fetchall()
+        pk_cols = [c["name"] for c in cols if c["pk"]]
+        if pk_cols and pk_cols != ["sample_id", "wall_id"]:
+            self.conn.executescript(
+                "ALTER TABLE samples RENAME TO samples_legacy;"
+                "CREATE TABLE samples ("
+                "sample_id TEXT NOT NULL, wall_id TEXT NOT NULL REFERENCES walls(wall_id),"
+                "data_json TEXT NOT NULL, created_ts TEXT NOT NULL,"
+                "PRIMARY KEY (sample_id, wall_id));"
+                "INSERT INTO samples(sample_id,wall_id,data_json,created_ts) "
+                "SELECT sample_id,wall_id,data_json,created_ts FROM samples_legacy;"
+                "DROP TABLE samples_legacy;")
 
     def close(self):
         self.conn.close()
@@ -115,7 +132,7 @@ class Store:
                     "INSERT INTO samples(sample_id,wall_id,data_json,created_ts) VALUES(?,?,?,?)",
                     (sid, wall_id, json.dumps(it, ensure_ascii=False), _now()))
             except sqlite3.IntegrityError as exc:
-                raise LookupError(f"样本 {sid} 已存在") from exc
+                raise LookupError(f"墙体 {wall_id} 下样本 {sid} 已存在") from exc
             ids.append(sid)
         self.conn.commit()
         return ids
