@@ -116,6 +116,109 @@ def broken_dataset():
     return [bad, bad2]
 
 
+# ---------------------------------------------------------------- 场景 C：敷贴试验
+
+C_LAYERS = [  # 处理区/对照区共用层登记：体积(m³) × 干密度(kg/m³) = 层干质量
+    {"layer_id": "L1_pigment", "volume_m3": 0.0005, "dry_density_kg_m3": 1200},
+    {"layer_id": "L2_plaster", "volume_m3": 0.0035, "dry_density_kg_m3": 1500},
+    {"layer_id": "L3_mud", "volume_m3": 0.004, "dry_density_kg_m3": 1600},
+]
+
+
+def poultice_wall_samples():
+    """处理区(500,200) 与对照区(1500,200) 的处理前/后分层样本 + 复核用干湿样本。
+
+    处理区：敷贴后各层净减、深层不升（真脱盐）；对照区：自然漂移 ×1.05。
+    """
+    out = []
+    plan_t = [(3, 80, 20, 24, 6), (20, 60, 15, 30, 8), (55, 40, 10, 36, 9)]
+    for d, na0, ca0, na1, ca1 in plan_t:
+        out.append(_sample(f"tpre{d}", 500, 200, d, "2026-06-01T09:00:00",
+                           na0, ca0, 5.5))
+        out.append(_sample(f"tpost{d}", 500, 200, d, "2026-08-20T09:00:00",
+                           na1, ca1, 5.0))
+    plan_c = [(3, 30, 8, 31.5, 8.4), (20, 25, 6, 26.25, 6.3), (55, 20, 5, 21, 5.25)]
+    for d, na0, ca0, na1, ca1 in plan_c:
+        out.append(_sample(f"cpre{d}", 1500, 200, d, "2026-06-01T10:00:00",
+                           na0, ca0, 5.0))
+        out.append(_sample(f"cpost{d}", 1500, 200, d, "2026-08-20T10:00:00",
+                           na1, ca1, 4.8))
+    # 来源复核闭环所需：低带雨后湿样 + 高带干/湿样
+    for d in (3, 20, 55):
+        out.append(_sample(f"lw{d}", 500, 200, d, "2026-06-10T10:00:00",
+                           40, 8, 10.0))
+        out.append(_sample(f"hd{d}", 500, 3700, d, "2026-06-01T11:00:00",
+                           15, 3, 3.5))
+        out.append(_sample(f"hw{d}", 500, 3700, d, "2026-06-10T11:00:00",
+                           15, 3, 4.0))
+    return out
+
+
+def poultice_trial_body(source_version_id, rain_id):
+    bindings = []
+    for zone, prefix in (("treatment", "t"), ("control", "c")):
+        for phase in ("pre", "post"):
+            for d in (3, 20, 55):
+                bindings.append({"sample_id": f"{prefix}{phase}{d}",
+                                 "zone": zone, "phase": phase})
+    return {
+        "name": "北壁东段纤维素敷贴脱盐试验",
+        "source_version_id": source_version_id,
+        "treatment_zone": {"x_mm": 500, "y_mm": 200, "radius_mm": 300},
+        "control_zone": {"x_mm": 1500, "y_mm": 200, "radius_mm": 300},
+        "layers": C_LAYERS, "control_layers": [dict(x) for x in C_LAYERS],
+        "poultice": {"material": "纤维素纸浆", "water_content_percent": 45,
+                     "contact_area_m2": 0.28},
+        "bindings": bindings,
+        "env_rain_ids": [rain_id],
+    }
+
+
+def _extract_round(rid, start, end, na=160, ca=40, vol=0.5):
+    return {"round_id": rid, "cover_start_ts": start, "cover_end_ts": end,
+            "extract": {"volume_l": vol, "ions": {
+                "Na+": {"value": na, "unit": "mmol/L", "lod": 0.2},
+                "Cl-": {"value": na, "unit": "mmol/L", "lod": 0.2},
+                "Ca2+": {"value": ca, "unit": "mmol/L", "lod": 0.2},
+                "SO42-": {"value": ca, "unit": "mmol/L", "lod": 0.2}}}}
+
+
+def poultice_rounds(with_contaminated=True):
+    rounds = [
+        _extract_round("R1", "2026-07-01T09:00:00", "2026-07-03T09:00:00"),
+        _extract_round("R2", "2026-07-08T09:00:00", "2026-07-10T09:00:00"),
+        _extract_round("R3", "2026-07-15T09:00:00", "2026-07-17T09:00:00"),
+    ]
+    if with_contaminated:
+        # R4 钠异常：疑敷贴材料本底污染，会把收支账撑破
+        rounds.append(_extract_round("R4", "2026-07-22T09:00:00",
+                                     "2026-07-24T09:00:00", na=900))
+    return rounds
+
+
+def show_trial(title, result):
+    line("=" * 78)
+    line(title)
+    line("-" * 78)
+    for g in result["gates"]:
+        mark = "PASS" if g["passed"] else "FAIL"
+        line(f"[{mark}] {g['name']}" + (f"  — {g['detail']}" if g["detail"] else ""))
+    t = result["balance"]["total"]
+    line(f"\n  收支：累计浸出 {t['extract_mmol']} mmol ｜ 漂移校正墙内净减 "
+         f"{t['loss_corr_mmol']} mmol ｜ 残差 {t['residual_mmol']} mmol "
+         f"（{'闭合' if result['balance']['closed'] else '不闭合'}）")
+    inv = result["inventory"]
+    line(f"  库存：处理区 {inv['treatment']['pre_total_mmol']} → "
+         f"{inv['treatment']['post_total_mmol']} mmol；对照区 "
+         f"{inv['control']['pre_total_mmol']} → {inv['control']['post_total_mmol']} mmol")
+    line(f"  分类：{result['classification_name']}（{result['classification']}）")
+    d = result["decision"]
+    line(f"  决定：{d['name']} —— {d['reason']}")
+    line("  建议：")
+    for a in result["advice"]:
+        line(f"    {a['priority']}. [{a['purpose']}] {a['location']}；{a['timing']}")
+
+
 def line(t=""):
     print(t)
 
@@ -196,6 +299,67 @@ def main():
          f"input_hash={payload['input_hash']}")
     line(f"剖面 SVG：{len(svg)} 字节，以 <svg> 开头：{svg.lstrip().startswith('<svg')}")
     line(f"修订账可查询：{[r['rev_id'] for r in app.get_revisions(wid)['revisions']]}")
+
+    # ---------- 场景 C：敷贴脱盐试验（接入同一 API，独立试验修订账） ----------
+    line("\n" + "=" * 78)
+    line("场景 C：敷贴脱盐试验 —— 表面电导降了，盐是真离墙还是退到地杖深处？")
+    wall_c = app.create_wall(dict(WALL, name="西配殿北壁（敷贴试验墙）"))["wall"]
+    wc = wall_c["wall_id"]
+    app.add_samples(wc, poultice_wall_samples())
+    # rains 表 rain_id 全局唯一，场景 C 用独立降雨记录
+    rain_id = app.add_rains(wc, [dict(RAINS[0], rain_id="rain_c_0609")])["rain_ids"][0]
+    verdict_c = app.get_analysis(wc)["analysis"]["verdict"]
+    locked_c = app.lock(wc, {"actor": "张工"})
+    line(f"来源复核封版：{locked_c['version_id']}（裁决 {verdict_c} → "
+         f"{locked_c['unique_source_name']}），作为试验引用来源")
+
+    trial = app.create_trial(wc, poultice_trial_body(locked_c["version_id"],
+                                                     rain_id))["trial"]
+    tid = trial["trial_id"]
+    app.add_rounds(tid, poultice_rounds())
+    line(f"试验 {tid}：处理区(500,200)r300 ｜ 对照区(1500,200)r300 ｜ "
+         "4 轮浸出液入账（R4 钠异常）")
+
+    a0 = app.get_trial_analysis(tid)["analysis"]
+    show_trial("场景 C-1：含污染浸出液的首次核算（收支被撑破，不得结束）", a0)
+    assert a0["classification"] == "insufficient_evidence"
+    assert not a0["decision"]["can_end"]
+
+    rev = app.add_trial_revision(tid, {
+        "kind": "exclude_extract",
+        "reason": "R4 浸出液钠浓度异常，空白对照证实为敷贴材料本底污染，"
+                  "不代表墙内脱出的盐，经双人复核剔除，原始数据保留。",
+        "payload": {"round_id": "R4"},
+        "actor": "张工/李工",
+    })
+    line(f"\n已生成试验修订 {rev['revision']['rev_id']}（独立试验修订账，"
+         f"seq={rev['revision']['seq']}），即时分类：{rev['classification']}")
+
+    a1 = app.get_trial_analysis(tid)["analysis"]
+    show_trial("场景 C-2：剔除污染液后 —— 收支闭合判净移除，"
+               "但残盐仍高于对照区，不得结束", a1)
+    assert a1["classification"] == "net_removal"
+    assert a1["decision"]["code"] == "continue_treatment"
+
+    conf = app.confirm_trial(tid, {"actor": "张工"})
+    line("\n确认版（固定来源、轮次与决定）："
+         + json.dumps({k: conf[k] for k in
+                       ("version_id", "source_version_id", "confirm_hash",
+                        "classification")}, ensure_ascii=False))
+    ctype, raw, _ = app.get_trial_version(conf["version_id"], "/rounds.json")
+    payload = json.loads(raw)
+    from .poultice_recompute import verify as verify_confirm
+    ok = verify_confirm(payload)
+    _, svg_c, _ = app.get_trial_version(conf["version_id"], "/balance.svg")
+    line(f"逐轮 JSON：{len(raw)} 字节，复算一致={ok}，"
+         f"confirm_hash={payload['confirm_hash']}")
+    line(f"收支 SVG：{len(svg_c)} 字节，以 <svg> 开头："
+         f"{svg_c.lstrip().startswith('<svg')}")
+    try:
+        app.add_rounds(tid, poultice_rounds(with_contaminated=False))
+        raise SystemExit("确认版后竟然还能写入！")
+    except PermissionError as e:
+        line(f"确认版只读校验：409 — {e}")
     line("演示结束。")
 
 

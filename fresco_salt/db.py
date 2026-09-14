@@ -1,4 +1,5 @@
-"""SQLite 持久化：墙体模型 / 样本 / 降雨 / 修缮 / 修订账 / 封版版本。"""
+"""SQLite 持久化：墙体模型 / 样本 / 降雨 / 修缮 / 修订账 / 封版版本 /
+敷贴试验 / 试验轮次 / 试验修订账（独立保存）/ 试验确认版。"""
 from __future__ import annotations
 
 import json
@@ -57,6 +58,38 @@ CREATE TABLE IF NOT EXISTS versions (
     wall_id TEXT NOT NULL REFERENCES walls(wall_id),
     created_ts TEXT NOT NULL,
     recompute_json TEXT NOT NULL,
+    svg TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS trials (
+    trial_id TEXT PRIMARY KEY,
+    wall_id TEXT NOT NULL REFERENCES walls(wall_id),
+    data_json TEXT NOT NULL,
+    locked INTEGER NOT NULL DEFAULT 0,
+    locked_version_id TEXT,
+    created_ts TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS trial_rounds (
+    round_id TEXT NOT NULL,
+    trial_id TEXT NOT NULL REFERENCES trials(trial_id),
+    data_json TEXT NOT NULL,
+    created_ts TEXT NOT NULL,
+    PRIMARY KEY (round_id, trial_id)
+);
+CREATE TABLE IF NOT EXISTS trial_revisions (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    trial_id TEXT NOT NULL REFERENCES trials(trial_id),
+    rev_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    actor TEXT,
+    created_ts TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS trial_versions (
+    version_id TEXT PRIMARY KEY,
+    trial_id TEXT NOT NULL REFERENCES trials(trial_id),
+    created_ts TEXT NOT NULL,
+    confirm_json TEXT NOT NULL,
     svg TEXT NOT NULL
 );
 """
@@ -223,3 +256,121 @@ class Store:
     def bundle(self, wall_id: str) -> Dict[str, List[Dict[str, Any]]]:
         return {"samples": self.get_samples(wall_id), "rains": self.get_rains(wall_id),
                 "repairs": self.get_repairs(wall_id), "revisions": self.get_revisions(wall_id)}
+
+    # ---------------------------------------------------------- trials
+    def create_trial(self, wall_id: str, model: Dict[str, Any]) -> Dict[str, Any]:
+        trial_id = model.get("trial_id") or f"t_{_uid()}"
+        if self.get_trial(trial_id):
+            raise LookupError(f"试验 {trial_id} 已存在")
+        model = dict(model, trial_id=trial_id, wall_id=wall_id)
+        self.conn.execute(
+            "INSERT INTO trials(trial_id,wall_id,data_json,created_ts) VALUES(?,?,?,?)",
+            (trial_id, wall_id, json.dumps(model, ensure_ascii=False), _now()))
+        self.conn.commit()
+        return model
+
+    def get_trial(self, trial_id: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute("SELECT * FROM trials WHERE trial_id=?",
+                                (trial_id,)).fetchone()
+        if not row:
+            return None
+        model = json.loads(row["data_json"])
+        model["_locked"] = bool(row["locked"])
+        model["_locked_version_id"] = row["locked_version_id"]
+        return model
+
+    def list_trials(self, wall_id: str) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT trial_id,data_json,locked,locked_version_id FROM trials"
+            " WHERE wall_id=? ORDER BY created_ts", (wall_id,)).fetchall()
+        out = []
+        for r in rows:
+            m = json.loads(r["data_json"])
+            out.append({"trial_id": r["trial_id"], "name": m.get("name"),
+                        "source_version_id": m.get("source_version_id"),
+                        "locked": bool(r["locked"]),
+                        "locked_version_id": r["locked_version_id"]})
+        return out
+
+    def assert_trial_unlocked(self, trial_id: str) -> None:
+        t = self.get_trial(trial_id)
+        if t and t.get("_locked"):
+            raise PermissionError(
+                f"试验 {trial_id} 已确认封版（版本 {t['_locked_version_id']}），"
+                "轮次、绑定与修订只读；如需变更须新建试验")
+
+    def add_rounds(self, trial_id: str, items: List[Dict[str, Any]]) -> List[str]:
+        ids = []
+        for it in items:
+            rid = it.get("round_id") or f"rd_{_uid()}"
+            it = dict(it, round_id=rid)
+            try:
+                self.conn.execute(
+                    "INSERT INTO trial_rounds(round_id,trial_id,data_json,created_ts)"
+                    " VALUES(?,?,?,?)",
+                    (rid, trial_id, json.dumps(it, ensure_ascii=False), _now()))
+            except sqlite3.IntegrityError as exc:
+                raise LookupError(f"试验 {trial_id} 下轮次 {rid} 已存在") from exc
+            ids.append(rid)
+        self.conn.commit()
+        return ids
+
+    def get_rounds(self, trial_id: str) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT data_json FROM trial_rounds WHERE trial_id=?", (trial_id,)).fetchall()
+        return [json.loads(r["data_json"]) for r in rows]
+
+    # ---------------------------------------------------------- trial revisions
+    def add_trial_revision(self, trial_id: str, kind: str, reason: str,
+                           payload: Dict[str, Any], actor: Optional[str]) -> Dict[str, Any]:
+        rev_id = f"trev_{_uid()}"
+        cur = self.conn.execute(
+            "INSERT INTO trial_revisions(trial_id,rev_id,kind,reason,payload_json,"
+            "actor,created_ts) VALUES(?,?,?,?,?,?,?)",
+            (trial_id, rev_id, kind, reason, json.dumps(payload, ensure_ascii=False),
+             actor, _now()))
+        self.conn.commit()
+        return {"seq": cur.lastrowid, "rev_id": rev_id, "trial_id": trial_id,
+                "kind": kind, "reason": reason, "payload": payload, "actor": actor,
+                "created_ts": _now()}
+
+    def get_trial_revisions(self, trial_id: str) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM trial_revisions WHERE trial_id=? ORDER BY seq",
+            (trial_id,)).fetchall()
+        return [{"seq": r["seq"], "rev_id": r["rev_id"], "trial_id": trial_id,
+                 "kind": r["kind"], "reason": r["reason"], "actor": r["actor"],
+                 "created_ts": r["created_ts"],
+                 "payload": json.loads(r["payload_json"])} for r in rows]
+
+    # ---------------------------------------------------------- trial versions
+    def save_trial_version(self, version_id: str, trial_id: str,
+                           confirm: Dict[str, Any], svg: str) -> None:
+        self.conn.execute(
+            "INSERT INTO trial_versions(version_id,trial_id,created_ts,confirm_json,svg)"
+            " VALUES(?,?,?,?,?)",
+            (version_id, trial_id, _now(),
+             json.dumps(confirm, ensure_ascii=False), svg))
+        self.conn.execute("UPDATE trials SET locked=1, locked_version_id=?"
+                          " WHERE trial_id=?", (version_id, trial_id))
+        self.conn.commit()
+
+    def get_trial_version(self, version_id: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute("SELECT * FROM trial_versions WHERE version_id=?",
+                                (version_id,)).fetchone()
+        if not row:
+            return None
+        return {"version_id": version_id, "trial_id": row["trial_id"],
+                "created_ts": row["created_ts"], "svg": row["svg"],
+                "confirm": json.loads(row["confirm_json"])}
+
+    def list_trial_versions(self, trial_id: str) -> List[Dict[str, str]]:
+        rows = self.conn.execute(
+            "SELECT version_id,created_ts FROM trial_versions WHERE trial_id=?"
+            " ORDER BY created_ts", (trial_id,)).fetchall()
+        return [{"version_id": r["version_id"], "created_ts": r["created_ts"]}
+                for r in rows]
+
+    def trial_bundle(self, trial_id: str) -> Dict[str, List[Dict[str, Any]]]:
+        return {"rounds": self.get_rounds(trial_id),
+                "revisions": self.get_trial_revisions(trial_id)}
