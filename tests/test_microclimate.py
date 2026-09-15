@@ -1,6 +1,8 @@
 """微气候结晶循环模块测试：滞回状态机、六类待判缺口、改绑/保守规则修订、
 确认版冻结复算与 HTTP 端到端。"""
 import json
+import os
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -14,6 +16,7 @@ from fresco_salt.microclimate import (
     analyze_monitor, derive_conservative_rule, resolve_mapping, scan_rule,
 )
 from fresco_salt.microclimate_recompute import build_confirm, verify
+from fresco_salt.microclimate_svg import render_risk_svg
 
 RULE_NACL = {"rule_id": "nacl", "salt": "NaCl", "cn": "氯化钠",
              "drh_percent": 75.3, "crh_percent": 70.0,
@@ -355,6 +358,185 @@ class ConfirmTests(unittest.TestCase):
         c2 = build_confirm(WALL, monitor(), readings("s1", temp=5.0), revs, SRC_OK)
         self.assertTrue(verify(c2))
         self.assertEqual(c2["result"]["n_pending"], 0)
+
+
+class OpenWetLongestTests(unittest.TestCase):
+    """开口湿润段（期末/断档未析晶）达标后须参与最长湿润段统计的边界回归。
+
+    回归背景：序列在高湿中收尾时 open_wet.hours 已越过 min_wet_hours，
+    longest_wet_hours 却仍为 None——开口段此前只登记 open_wet，不进最长值比较。
+    """
+
+    def test_open_wet_at_series_end_counts_toward_longest(self):
+        """期末未析晶：开口湿润 16.35h ≥ min_wet 6h → 计入最长湿润段。"""
+        pts = [pt(T0 + timedelta(hours=3 * i), 22.0, v)
+               for i, v in enumerate([58, 72, 78, 77, 72, 78, 78, 78])]
+        r = scan_rule(pts, RULE_NACL, 6.0)
+        self.assertEqual(r["n_segments"], 1)
+        self.assertEqual(r["n_complete_cycles"], 0)
+        self.assertEqual(r["open_wet"], {"start_ts": "2026-08-01T04:39:00",
+                                         "hours": 16.35,
+                                         "segment_end_ts": "2026-08-01T21:00:00"})
+        # 修复前此处为 None：开口段达标但未进最长值比较
+        self.assertEqual(r["longest_wet_hours"], 16.35)
+        self.assertEqual(r["first_risk_ts"], "2026-08-01T04:39:00")
+
+    def test_open_wet_below_min_wet_still_excluded(self):
+        """开口湿润仅 3.45h < min_wet 6h → 仍排除：不登记开口段、不进最长值。"""
+        pts = [pt(T0 + timedelta(hours=3 * i), 22.0, v)
+               for i, v in enumerate([60, 60, 60, 78, 78])]
+        r = scan_rule(pts, RULE_NACL, 6.0)
+        self.assertIsNone(r["open_wet"])
+        self.assertIsNone(r["longest_wet_hours"])
+        self.assertIsNone(r["first_risk_ts"])
+        self.assertEqual(r["n_complete_cycles"], 0)
+        self.assertEqual(r["n_short_returns"], 0)
+
+    def test_closed_and_open_take_actual_max_open_wins(self):
+        """闭合段 7.783h 与开口段 15.45h 并存 → 最长取实际最大值（开口段）。"""
+        rh = [60, 78, 78, 78, 60, 60, 60, 78, 78, 78, 78, 78, 78]
+        pts = [pt(T0 + timedelta(hours=3 * i), 22.0, v) for i, v in enumerate(rh)]
+        r = scan_rule(pts, RULE_NACL, 6.0)
+        self.assertEqual(r["n_complete_cycles"], 1)
+        self.assertEqual(r["cycles"][0]["wet_hours"], 7.783)
+        self.assertEqual(r["open_wet"]["hours"], 15.45)
+        self.assertEqual(r["longest_wet_hours"], 15.45)
+        # 首风险时刻仍是更早的闭合段起点
+        self.assertEqual(r["first_risk_ts"], "2026-08-01T02:33:00")
+
+    def test_closed_and_open_take_actual_max_closed_wins(self):
+        """闭合段 13.783h 长于达标开口段 12.45h → 最长仍取闭合段。"""
+        rh = [60, 78, 78, 78, 78, 78, 60, 60, 60, 78, 78, 78, 78, 78]
+        pts = [pt(T0 + timedelta(hours=3 * i), 22.0, v) for i, v in enumerate(rh)]
+        r = scan_rule(pts, RULE_NACL, 6.0)
+        self.assertEqual(r["n_complete_cycles"], 1)
+        self.assertEqual(r["open_wet"]["hours"], 12.45)
+        self.assertEqual(r["longest_wet_hours"], 13.783)
+        self.assertEqual(r["first_risk_ts"], "2026-08-01T02:33:00")
+
+    def test_gap_open_wet_counts_toward_longest(self):
+        """采样断档：断档处未闭合的湿润段达标后计入最长值，不与后续拼接。"""
+        a = [pt(T0 + timedelta(hours=3 * i), 22.0, v)
+             for i, v in enumerate([60, 78, 78, 78])]
+        b = [pt(T0 + timedelta(hours=48 + 3 * i), 22.0, 60) for i in range(2)]
+        r = scan_rule(a + b, RULE_NACL, 6.0)
+        self.assertEqual(r["n_segments"], 2)
+        self.assertEqual(r["n_complete_cycles"], 0)
+        self.assertEqual(r["open_wet"], {"start_ts": "2026-08-01T02:33:00",
+                                         "hours": 6.45,
+                                         "segment_end_ts": "2026-08-01T09:00:00"})
+        self.assertEqual(r["longest_wet_hours"], 6.45)
+        self.assertEqual(r["first_risk_ts"], "2026-08-01T02:33:00")
+
+    def test_multi_segment_open_wet_max(self):
+        """多段序列：第一段闭合湿润 7.783h、第二段开口 9.45h → 跨段取最大。"""
+        s1 = [pt(T0 + timedelta(hours=3 * i), 22.0, v)
+              for i, v in enumerate([60, 78, 78, 78, 60])]
+        s2 = [pt(T0 + timedelta(hours=24 + 3 * i), 22.0, v)
+              for i, v in enumerate([60, 60, 78, 78, 78, 78])]
+        r = scan_rule(s1 + s2, RULE_NACL, 6.0)
+        self.assertEqual(r["n_segments"], 2)
+        # 第一段干燥停留仅 1.667h < min_dry：闭合段合格但不构成完整循环
+        self.assertEqual(r["n_complete_cycles"], 0)
+        self.assertEqual(r["cycles"][0]["incomplete_reason"], "dry_dwell_too_short")
+        self.assertEqual(r["open_wet"]["hours"], 9.45)
+        self.assertEqual(r["longest_wet_hours"], 9.45)
+        self.assertEqual(r["first_risk_ts"], "2026-08-01T02:33:00")
+
+
+class OpenWetConsistencyTests(unittest.TestCase):
+    """分区汇总、确认版复算 JSON、风险 SVG 三处对开口湿润段的口径一致。"""
+
+    def _end_wet_readings(self):
+        rds = readings("s1", days=1)
+        for x in rds[-3:]:
+            x["rh"] = 78.0  # 期末停在高湿：开口湿润 16.35h，无完整循环
+        return rds
+
+    def test_zone_confirm_svg_agree_on_open_wet_longest(self):
+        rds = self._end_wet_readings()
+        m = monitor()
+        result = analyze_monitor(WALL, m, rds, [], SRC_OK)
+        z = result["zones"][0]
+        # 分区汇总：规则行 → 分区取同一最长值
+        self.assertEqual(z["rules"][0]["longest_wet_hours"], 16.35)
+        self.assertEqual(z["longest_wet_hours"], 16.35)
+        self.assertEqual(z["open_wet"], {"rule_id": "nacl",
+                                         "start_ts": "2026-08-01T04:39:00",
+                                         "hours": 16.35,
+                                         "segment_end_ts": "2026-08-01T21:00:00"})
+        self.assertEqual(z["first_risk_ts"], "2026-08-01T04:39:00")
+        self.assertEqual(z["n_complete_cycles"], 0)
+        self.assertEqual(z["risk_level"], "current_wet")
+        # 确认版复算 JSON：逐区结果一致，确认哈希固定
+        conf = build_confirm(WALL, m, rds, [], SRC_OK)
+        self.assertTrue(verify(conf))
+        cz = conf["result"]["zones"][0]
+        self.assertEqual(cz["longest_wet_hours"], z["longest_wet_hours"])
+        self.assertEqual(cz["open_wet"], z["open_wet"])
+        self.assertEqual(cz["first_risk_ts"], z["first_risk_ts"])
+        self.assertEqual(cz["n_complete_cycles"], 0)
+        self.assertEqual(conf["confirm_hash"], "a743834ddb9f6a6e")
+        # 风险 SVG：统计面板最长湿润条与开口警示反映同一湿润段
+        svg = render_risk_svg(m, conf["result"])
+        self.assertIn("最长湿润 16.35h", svg)
+        self.assertIn("开口湿润 16.35h", svg)
+
+
+class OpenWetPersistenceTests(unittest.TestCase):
+    """涉及持久化的回归：确认版写入临时 SQLite 文件后可原样读回并复算。"""
+
+    def test_confirm_persisted_to_temp_sqlite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "microclimate.db")
+            store = Store(db_path)
+            app = SaltApiApp(store)
+            try:
+                wid = app.create_wall(HTTP_WALL)["wall"]["wall_id"]
+                app.add_samples(wid, wall_samples())
+                app.add_rains(wid, [{"ts": "2026-06-09T02:00:00", "rain_mm": 18.0}])
+                self.assertEqual(app.get_analysis(wid)["analysis"]["verdict"],
+                                 "unique_source")
+                src_vid = app.lock(wid, {"actor": "张工"})["version_id"]
+                body = dict(MON_BODY, source_version_id=src_vid)
+                mid = app.create_monitor(wid, body)["monitor"]["monitor_id"]
+                rds = readings("s1", days=1)
+                for x in rds[-3:]:
+                    x["rh"] = 78.0  # 期末未析晶：开口湿润 16.35h
+                app.add_readings(mid, rds)
+                conf = app.confirm_monitor(mid, {"actor": "张工"})
+                vid = conf["version_id"]
+                # 读回 zones.json：开口湿润段已计入最长值
+                ct, payload, _ = app.get_monitor_version(vid, "/zones.json")
+                self.assertEqual(ct, "application/json")
+                rec = json.loads(payload)
+                self.assertTrue(verify(rec))
+                z = rec["result"]["zones"][0]
+                self.assertEqual(z["longest_wet_hours"], 16.35)
+                self.assertEqual(z["open_wet"],
+                                 {"rule_id": "nacl",
+                                  "start_ts": "2026-08-01T04:39:00", "hours": 16.35,
+                                  "segment_end_ts": "2026-08-01T21:00:00"})
+                self.assertEqual(z["first_risk_ts"], "2026-08-01T04:39:00")
+                self.assertEqual(z["n_complete_cycles"], 0)
+                self.assertEqual(rec["confirm_hash"], conf["confirm_hash"])
+                # 读回 risk.svg：统计面板与开口警示是同一最长湿润段
+                ct, svg, _ = app.get_monitor_version(vid, "/risk.svg")
+                self.assertEqual(ct, "image/svg+xml")
+                self.assertIn("最长湿润 16.35h", svg)
+                self.assertIn("开口湿润 16.35h", svg)
+            finally:
+                store.close()
+            # 重新打开同一 SQLite 文件：确认版与 SVG 持久保存且仍可复算
+            store2 = Store(db_path)
+            try:
+                v = store2.get_monitor_version(vid)
+                self.assertIsNotNone(v)
+                self.assertEqual(v["confirm"]["confirm_hash"], conf["confirm_hash"])
+                self.assertTrue(verify(v["confirm"]))
+                self.assertIn("开口湿润 16.35h", v["svg"])
+            finally:
+                store2.close()
 
 
 # ---------------------------------------------------------------- HTTP 端到端

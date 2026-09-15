@@ -501,6 +501,9 @@ def scan_rule(points: List[Dict[str, Any]], rule: Dict[str, Any],
             if we is None:
                 hours = hours_between(seg[-1]["ts"], ws)
                 if hours >= min_wet:
+                    # 达标的开口湿润段同样参与最长湿润段比较：
+                    # 期末/断档未析晶不代表该段不破坏，漏计会低估风险
+                    wet_qualified_durations.append(hours)
                     open_wet = {"start_ts": ws.isoformat(), "hours": r4(hours),
                                 "segment_end_ts": seg[-1]["ts"].isoformat()}
                     if first_risk_ts is None or ws < first_risk_ts:
